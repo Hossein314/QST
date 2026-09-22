@@ -1,0 +1,7 @@
+# Core engine
+numpy>=1.24
+opencv-python>=4.7
+PyMaxflow>=1.3.0
+
+# Desktop application (the engine itself does not need Qt)
+PySide6>=6.5

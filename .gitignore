@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+diffs/
+predictions/*.png
+samples/*
+!samples/.gitkeep
+ground_truth/*
+!ground_truth/.gitkeep
+
+/datasets
+26-QST.rar
