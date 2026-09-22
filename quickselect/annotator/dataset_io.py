@@ -177,6 +177,15 @@ class CocoDataset:
         cats.extend(self._extra_categories)
         return sorted(cats, key=lambda c: int(c.get("id", 0)))
 
+    def category_name_for(self, category_id: int) -> str:
+        """Human name for a class id, including classes we only pass through."""
+        if int(category_id) == int(self.category_id):
+            return self.category_name
+        for cat in self._extra_categories:
+            if int(cat.get("id", -1)) == int(category_id):
+                return str(cat.get("name", category_id))
+        return str(category_id)
+
     # ------------------------------------------------------------------ #
     def register_image(self, file_name: str, width: int, height: int) -> ImageRecord:
         """Get (or create) the record for an image, keeping its existing id."""

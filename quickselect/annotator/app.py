@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import numpy as np
-from PySide6.QtCore import QMetaObject, QThread, Qt, Slot
+from PySide6.QtCore import QEvent, QMetaObject, QThread, Qt, Slot
 from PySide6.QtGui import QAction, QColor, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
@@ -42,7 +42,7 @@ from ..constraints import NEGATIVE, POSITIVE
 from ..engine import SelectionMode
 from ..io_utils import load_image
 from ..segmenter import SegmentParams
-from ..ui.canvas import SELECTION, Canvas
+from ..ui.canvas import INTERACT_PAINT, INTERACT_PICK, SELECTION, Canvas
 from .dataset_io import (
     DEFAULT_CATEGORY_ID,
     DEFAULT_CATEGORY_NAME,
@@ -50,6 +50,8 @@ from .dataset_io import (
     CocoDataset,
     scan_folder,
 )
+from .editing import AppMode, InstanceEditor
+from .instance_view import build_instance_layers
 from .session import AnnotationSession
 
 # Overlay layers, drawn in this order.
@@ -57,6 +59,13 @@ LAYER_COMMITTED = "committed"
 LAYER_CURRENT = SELECTION          # reuses the canvas' ants-enabled layer
 LAYER_POS = "constraint_pos"
 LAYER_NEG = "constraint_neg"
+# Edit Mode draws every existing instance into one layer, with its outlines in
+# a matching path layer.
+LAYER_INSTANCES = "edit_instances"
+PATHS_INSTANCES = "edit_outlines"
+
+#: Layers that belong to the annotation workflow and have no place in Edit Mode.
+ANNOTATE_LAYERS = (LAYER_COMMITTED, LAYER_CURRENT, LAYER_POS, LAYER_NEG)
 
 COLOR_COMMITTED = QColor(232, 160, 58, 95)
 COLOR_CURRENT = QColor(64, 132, 255, 110)
@@ -80,6 +89,8 @@ class AnnotatorWindow(QMainWindow):
         self.index = -1
         self.dataset: Optional[CocoDataset] = None
         self.session: Optional[AnnotationSession] = None
+        self.app_mode = AppMode.ANNOTATE
+        self.editor = InstanceEditor()
         self._image: Optional[np.ndarray] = None
         self._last_timings = ""
         self._busy = False
@@ -98,6 +109,15 @@ class AnnotatorWindow(QMainWindow):
         self.canvas.strokeBegan.connect(self._on_stroke_began)
         self.canvas.strokeMoved.connect(self._on_stroke_moved)
         self.canvas.strokeEnded.connect(self._on_stroke_ended)
+        self.canvas.cursorMoved.connect(self._on_cursor_moved)
+        self.canvas.picked.connect(self._on_picked)
+
+        # Tab is focus navigation everywhere in Qt, so it never reaches a
+        # QAction shortcut. Filtering it at the application level is the only
+        # way to own the key -- and swallowing it means it does nothing else.
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
 
         if folder:
             self.open_folder(Path(folder))
@@ -137,6 +157,16 @@ class AnnotatorWindow(QMainWindow):
         inst.addSeparator()
         self._act("&Undo", "Ctrl+Z", self.undo, inst)
         self._act("&Redo", ["Ctrl+Shift+Z", "Ctrl+Y"], self.redo, inst)
+
+        # Tab is handled by the event filter, not as a shortcut, so the menu
+        # entry only advertises it.
+        mode = self.menuBar().addMenu("&Mode")
+        self._act("&Toggle Annotate / Edit Mode  (Tab)", None, self.toggle_mode, mode)
+        mode.addSeparator()
+        self._act(
+            "&Delete Selected Instance", "Delete", self.delete_selected, mode
+        )
+        self._act("Des&elect", "Escape", self.deselect, mode)
 
         view = self.menuBar().addMenu("&View")
         self._act("Zoom &In", "Ctrl+=", lambda: self._zoom_by(1.25), view)
@@ -259,13 +289,26 @@ class AnnotatorWindow(QMainWindow):
         button("Save all", self.save_all, "Ctrl+S")
 
     def _build_status(self) -> None:
+        # The mode indicator lives in the status bar rather than in a banner of
+        # its own: always visible, never in the way of the image.
+        self.mode_label = QLabel()
+        font = self.mode_label.font()
+        font.setBold(True)
+        self.mode_label.setFont(font)
         self.image_label = QLabel("no folder")
         self.instance_label = QLabel("")
         self.class_label = QLabel(f"class {self.category_id}: {self.category_name}")
+        self.selection_label = QLabel("")
         self.timing_label = QLabel("")
-        for w in (self.image_label, self.instance_label, self.class_label):
+        for w in (self.mode_label, self.image_label, self.instance_label,
+                  self.class_label, self.selection_label):
             self.statusBar().addWidget(w)
         self.statusBar().addPermanentWidget(self.timing_label)
+        self._update_mode_label()
+
+    def _update_mode_label(self) -> None:
+        self.mode_label.setText(f"  [{self.app_mode.label}]  ")
+        self.mode_label.setToolTip("Tab switches between Annotate and Edit Mode")
 
     def _start_worker(self) -> None:
         from .worker import SessionWorker
@@ -349,7 +392,9 @@ class AnnotatorWindow(QMainWindow):
         if existing:
             session.load_instances(existing)
 
+        session.category_id = self.category_id
         self.session = session
+        self.editor.set_session(session)
         self.worker.set_session(session)
         self.canvas.set_image(image)
         self._refresh_overlays()
@@ -387,6 +432,109 @@ class AnnotatorWindow(QMainWindow):
     def save_all(self) -> None:
         self._flush_current()
         self._save_dataset(quiet=False)
+
+    # ------------------------------------------------------------------ #
+    # Modes
+    # ------------------------------------------------------------------ #
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802
+        """Own the Tab key for this window, whatever has focus."""
+        if (
+            event.type() == QEvent.KeyPress
+            and event.key() in (Qt.Key_Tab, Qt.Key_Backtab)
+            and self.isActiveWindow()
+        ):
+            self.toggle_mode()
+            return True
+        return super().eventFilter(obj, event)
+
+    def toggle_mode(self) -> None:
+        self.set_mode(self.app_mode.toggled())
+
+    def set_mode(self, mode: AppMode) -> None:
+        if mode is self.app_mode:
+            return
+        if mode is AppMode.EDIT and self.session is None:
+            self.statusBar().showMessage(
+                "Edit Mode needs an open image  (Ctrl+O)", 2500
+            )
+            return
+        self.app_mode = mode
+        if mode is AppMode.ANNOTATE:
+            # Leaving Edit Mode drops the selection: it refers to instances
+            # that the brush is about to start seeding as background again.
+            self.editor.clear_selection()
+            self.editor.clear_hover()
+        self.canvas.interaction = (
+            INTERACT_PICK if mode is AppMode.EDIT else INTERACT_PAINT
+        )
+        self._update_mode_label()
+        self._refresh_overlays()
+        self._update_status()
+        self.statusBar().showMessage(
+            "Edit Mode -- click an instance to select, Delete removes it"
+            if mode is AppMode.EDIT
+            else "Annotate Mode -- paint to select, Enter commits",
+            2500,
+        )
+
+    @property
+    def editing(self) -> bool:
+        return self.app_mode is AppMode.EDIT
+
+    # ------------------------------------------------------------------ #
+    # Edit Mode interaction
+    # ------------------------------------------------------------------ #
+    @Slot(float, float)
+    def _on_cursor_moved(self, x: float, y: float) -> None:
+        if not self.editing or self.session is None:
+            return
+        if self.editor.set_hover_at(x, y):
+            self._refresh_overlays()
+
+    @Slot(float, float)
+    def _on_picked(self, x: float, y: float) -> None:
+        if not self.editing or self.session is None:
+            return
+        if self.editor.select_at(x, y):
+            self._refresh_overlays()
+            self._update_status()
+
+    def deselect(self) -> None:
+        if self.editing and self.editor.clear_selection():
+            self._refresh_overlays()
+            self._update_status()
+
+    def delete_selected(self) -> None:
+        """Delete key. Deliberately inert outside Edit Mode."""
+        if not self.editing:
+            self.statusBar().showMessage(
+                "Delete only removes instances in Edit Mode  (Tab)", 2500
+            )
+            return
+        if self.editor.selected is None:
+            self.statusBar().showMessage("No instance selected", 2000)
+            return
+        self._apply_edit(self.editor.delete_selected, "Nothing to delete")
+
+    def _apply_edit(self, operation, empty_message: str) -> None:
+        """Run one edit, then redraw and write the dataset back out.
+
+        Edits mutate the session from the GUI thread. That is safe because Edit
+        Mode cannot start a stroke, so the worker is idle here -- and if a pass
+        started before the mode switch is still running, the edit is refused
+        rather than racing it.
+        """
+        if self.session is None:
+            return
+        if self._busy:
+            self.statusBar().showMessage("Segmentation still running -- retry", 2000)
+            return
+        if operation() is None:
+            self.statusBar().showMessage(empty_message, 2000)
+            return
+        self._refresh_overlays()
+        self._update_status()
+        self._flush_current()   # persists to annotations.json, atomically
 
     # ------------------------------------------------------------------ #
     # Painting
@@ -463,10 +611,23 @@ class AnnotatorWindow(QMainWindow):
                                      Qt.QueuedConnection)
 
     def undo(self) -> None:
+        """Undo the last action *of the current mode*.
+
+        The two modes have separate histories because they edit different
+        things: constraints in Annotate Mode, instances in Edit Mode. Mixing
+        them into one stack would mean Ctrl+Z sometimes redrawing a brush mark
+        and sometimes resurrecting an annotation, with no way to tell which.
+        """
+        if self.editing:
+            self._apply_edit(self.editor.undo, "Nothing to undo in Edit Mode")
+            return
         if self.session is not None:
             QMetaObject.invokeMethod(self.worker, "undo", Qt.QueuedConnection)
 
     def redo(self) -> None:
+        if self.editing:
+            self._apply_edit(self.editor.redo, "Nothing to redo in Edit Mode")
+            return
         if self.session is not None:
             QMetaObject.invokeMethod(self.worker, "redo", Qt.QueuedConnection)
 
@@ -476,6 +637,30 @@ class AnnotatorWindow(QMainWindow):
     def _refresh_overlays(self) -> None:
         if self.session is None:
             return
+        if self.editing:
+            self._show_instance_overlays()
+        else:
+            self._show_annotation_overlays()
+
+    def _show_instance_overlays(self) -> None:
+        """Edit Mode: existing instances, each in its own colour."""
+        assert self.session is not None
+        for layer in ANNOTATE_LAYERS:
+            self.canvas.remove_overlay(layer)
+        rgba, paths = build_instance_layers(
+            self.session.instances,
+            self.session.height,
+            self.session.width,
+            hover=self.editor.hover,
+            selected=self.editor.selected,
+        )
+        self.canvas.set_overlay_rgba(LAYER_INSTANCES, rgba)
+        self.canvas.set_paths(PATHS_INSTANCES, paths)
+
+    def _show_annotation_overlays(self) -> None:
+        assert self.session is not None
+        self.canvas.remove_overlay(LAYER_INSTANCES)
+        self.canvas.remove_paths(PATHS_INSTANCES)
         if self.show_committed_action.isChecked():
             committed = self.session.committed_mask()
             self.canvas.set_overlay(
@@ -522,8 +707,25 @@ class AnnotatorWindow(QMainWindow):
         self.class_label.setText(
             f"class {self.category_id}: {self.category_name}   "
         )
+        self.selection_label.setText(self._selection_summary())
         if self._last_timings:
             self.timing_label.setText(f"  last pass: {self._last_timings}  ")
+
+    def _selection_summary(self) -> str:
+        """What the selected instance is, for the status bar."""
+        if not self.editing:
+            return ""
+        inst = self.editor.selected
+        if inst is None:
+            return "nothing selected   "
+        category = self.category_id if inst.category_id is None else inst.category_id
+        name = (
+            self.dataset.category_name_for(category)
+            if self.dataset is not None
+            else self.category_name
+        )
+        ident = "unsaved" if inst.annotation_id is None else f"#{inst.annotation_id}"
+        return f"selected {ident}  class {category}: {name}   "
 
     # ------------------------------------------------------------------ #
     # Options

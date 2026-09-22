@@ -11,7 +11,9 @@ Overlays are named and drawn in insertion order, which is what lets the
 annotation tool show committed instances, the instance being edited, and the
 raw constraint marks at the same time in different colours. Marching ants are
 drawn from contours extracted once per update and animated by advancing the
-pen's dash offset, so no new geometry is built per frame.
+pen's dash offset, so no new geometry is built per frame. Named *path* layers
+sit on top for outlines that are static rather than animated, which is how the
+annotator draws the border of every existing instance.
 """
 
 from __future__ import annotations
@@ -47,6 +49,39 @@ STYLE_CUTOUT = "cutout"
 
 SELECTION = "selection"
 
+#: What the left mouse button does. ``INTERACT_PAINT`` is the brush; under
+#: ``INTERACT_PICK`` the canvas emits :attr:`Canvas.picked` instead and no
+#: stroke signal is ever produced, which is what keeps the annotator's Edit
+#: Mode clicks away from the segmenter.
+INTERACT_PAINT = "paint"
+INTERACT_PICK = "pick"
+
+
+def contour_path(
+    binary: np.ndarray, sx: float = 1.0, sy: float = 1.0
+) -> Optional[QPainterPath]:
+    """Outline of a binary mask as a painter path, in image coordinates.
+
+    ``sx``/``sy`` scale a mask held at a coarser resolution than the image up
+    to image space.
+    """
+    contours, _ = cv2.findContours(
+        binary.astype(np.uint8), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE
+    )
+    path = QPainterPath()
+    drawn = False
+    for contour in contours:
+        simplified = cv2.approxPolyDP(contour, 0.8, True)
+        if len(simplified) < 2:
+            continue
+        pts = simplified.reshape(-1, 2).astype(np.float32) * (sx, sy)
+        path.moveTo(float(pts[0][0]), float(pts[0][1]))
+        for x, y in pts[1:]:
+            path.lineTo(float(x), float(y))
+        path.closeSubpath()
+        drawn = True
+    return path if drawn else None
+
 
 def numpy_to_qimage(rgb: np.ndarray) -> QImage:
     """RGB/RGBA/grayscale uint8 -> QImage, copied so it owns its buffer."""
@@ -76,6 +111,7 @@ class Canvas(QWidget):
     strokeEnded = Signal()
     zoomChanged = Signal(float)
     cursorMoved = Signal(float, float)
+    picked = Signal(float, float)                # left click under INTERACT_PICK
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -88,6 +124,8 @@ class Canvas(QWidget):
         self._image_size: Tuple[int, int] = (0, 0)  # (w, h) full resolution
         self._overlays: Dict[str, _Overlay] = {}
         self._order: List[str] = []
+        self._paths: Dict[str, List[Tuple[QPainterPath, QColor, float]]] = {}
+        self._path_order: List[str] = []
 
         self._zoom = 1.0
         self._offset = QPointF(0.0, 0.0)  # image-space point at widget origin
@@ -100,6 +138,7 @@ class Canvas(QWidget):
         self.brush_hardness = 0.85
         self.style = STYLE_BOTH
         self.mode = SelectionMode.NEW
+        self._interaction = INTERACT_PAINT
 
         self._painting = False
         self._panning = False
@@ -126,6 +165,8 @@ class Canvas(QWidget):
     def clear_overlays(self) -> None:
         self._overlays.clear()
         self._order.clear()
+        self._paths.clear()
+        self._path_order.clear()
         self.update()
 
     def set_overlay(
@@ -163,7 +204,7 @@ class Canvas(QWidget):
         if ants:
             sx = self._image_size[0] / float(w) if w else 1.0
             sy = self._image_size[1] / float(h) if h else 1.0
-            path = self._contour_path(alpha >= 0.5, sx, sy)
+            path = contour_path(alpha >= 0.5, sx, sy)
 
         if name not in self._overlays:
             self._order.append(name)
@@ -171,6 +212,49 @@ class Canvas(QWidget):
             image=numpy_to_qimage(rgba), color=color, ants=ants, path=path
         )
         self.update()
+
+    def set_overlay_rgba(self, name: str, rgba: Optional[np.ndarray]) -> None:
+        """Add or replace a named overlay from a pre-composited RGBA array.
+
+        The mask-plus-colour form of :meth:`set_overlay` cannot express a layer
+        that holds several colours at once, which is what the annotator needs
+        to draw every existing instance in its own colour without one canvas
+        overlay per instance.
+        """
+        if rgba is None or not getattr(rgba, "size", 0):
+            self.remove_overlay(name)
+            return
+        if name not in self._overlays:
+            self._order.append(name)
+        self._overlays[name] = _Overlay(
+            image=numpy_to_qimage(rgba), color=QColor(0, 0, 0, 0)
+        )
+        self.update()
+
+    def set_paths(
+        self,
+        name: str,
+        entries: Optional[List[Tuple[QPainterPath, QColor, float]]],
+    ) -> None:
+        """Add or replace a named set of outlines, in image coordinates.
+
+        Each entry is ``(path, colour, width)`` and is stroked with a cosmetic
+        pen, so the line keeps its width at every zoom level. Unlike marching
+        ants these are static -- they carry state, not attention.
+        """
+        if not entries:
+            self.remove_paths(name)
+            return
+        if name not in self._paths:
+            self._path_order.append(name)
+        self._paths[name] = list(entries)
+        self.update()
+
+    def remove_paths(self, name: str) -> None:
+        if name in self._paths:
+            del self._paths[name]
+            self._path_order.remove(name)
+            self.update()
 
     def remove_overlay(self, name: str) -> None:
         if name in self._overlays:
@@ -187,29 +271,33 @@ class Canvas(QWidget):
     def has_overlay(self, name: str) -> bool:
         return name in self._overlays
 
+    # ------------------------------------------------------------------ #
+    # Interaction
+    # ------------------------------------------------------------------ #
+    @property
+    def interaction(self) -> str:
+        return self._interaction
+
+    @interaction.setter
+    def interaction(self, value: str) -> None:
+        if value == self._interaction:
+            return
+        self._interaction = value
+        self._painting = False
+        # The brush ring is a lie when the button does not paint, so the
+        # pointer goes back to being a pointer.
+        self.setCursor(
+            Qt.BlankCursor if value == INTERACT_PAINT else Qt.ArrowCursor
+        )
+        self.update()
+
+    @property
+    def painting_enabled(self) -> bool:
+        return self._interaction == INTERACT_PAINT
+
     # -- compatibility with the single-selection app -------------------- #
     def set_selection(self, mask: Optional[np.ndarray]) -> None:
         self.set_overlay(SELECTION, mask, OVERLAY_COLOR, ants=True)
-
-    def _contour_path(
-        self, binary: np.ndarray, sx: float, sy: float
-    ) -> Optional[QPainterPath]:
-        contours, _ = cv2.findContours(
-            binary.astype(np.uint8), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE
-        )
-        path = QPainterPath()
-        drawn = False
-        for contour in contours:
-            simplified = cv2.approxPolyDP(contour, 0.8, True)
-            if len(simplified) < 2:
-                continue
-            pts = simplified.reshape(-1, 2).astype(np.float32) * (sx, sy)
-            path.moveTo(float(pts[0][0]), float(pts[0][1]))
-            for x, y in pts[1:]:
-                path.lineTo(float(x), float(y))
-            path.closeSubpath()
-            drawn = True
-        return path if drawn else None
 
     # ------------------------------------------------------------------ #
     # View transform
@@ -329,8 +417,18 @@ class Canvas(QWidget):
                     continue
                 self._draw_ants(painter, transform.map(ov.path))
 
+        self._draw_paths(painter, transform)
         self._draw_brush_cursor(painter)
         painter.end()
+
+    def _draw_paths(self, painter: QPainter, transform: QTransform) -> None:
+        for name in self._path_order:
+            for path, color, width in self._paths[name]:
+                pen = QPen(color, width)
+                pen.setCosmetic(True)
+                painter.setPen(pen)
+                painter.setBrush(Qt.NoBrush)
+                painter.drawPath(transform.map(path))
 
     def _draw_ants(self, painter: QPainter, path: QPainterPath) -> None:
         # A dark under-stroke keeps the ants visible on light images.
@@ -346,6 +444,8 @@ class Canvas(QWidget):
         painter.drawPath(path)
 
     def _draw_brush_cursor(self, painter: QPainter) -> None:
+        if not self.painting_enabled:
+            return  # the window manager's arrow is the cursor in pick mode
         if not self.underMouse() and not self._painting:
             return
         r = max(1.0, self.brush_diameter * 0.5 * self._zoom)
@@ -417,6 +517,10 @@ class Canvas(QWidget):
         if event.button() != Qt.LeftButton or self._pixmap is None:
             return
         img = self.widget_to_image(pos)
+        if not self.painting_enabled:
+            self.picked.emit(img.x(), img.y())
+            self.update()
+            return
         self._painting = True
         self.strokeBegan.emit(
             img.x(), img.y(), self._effective_mode(event.modifiers())

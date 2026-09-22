@@ -13,3 +13,6 @@ ground_truth/*
 
 /datasets
 26-QST.rar
+
+# agent worktrees / local tooling state
+.claude/

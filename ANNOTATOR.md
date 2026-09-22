@@ -4,6 +4,10 @@ Instance-segmentation annotation for electronic boards, built on the quick
 selection engine. You paint an object, commit it, move to the next one; the
 tool writes COCO polygons.
 
+It has two modes, switched with `Tab`: **Annotate Mode** creates new instances
+with the brush, **Edit Mode** lets you point at the instances already on the
+image and delete the ones that are wrong.
+
 ```bash
 pip install -r requirements.txt
 python annotate.py /path/to/images
@@ -28,17 +32,25 @@ read from and written to that same folder.
 5. **Move on** with `→`. Annotations for the current image are saved before the
    next one loads.
 
+To fix something that is already annotated, press `Tab` for Edit Mode — see
+[section 2](#2-edit-mode). The current mode is shown at the left of the status
+bar, in square brackets.
+
 ### Keys
 
 | key | action |
 | --- | --- |
+| `Tab` | switch between Annotate Mode and Edit Mode |
 | drag | paint foreground |
 | `Alt` + drag | paint background |
 | `Shift` + drag | force foreground regardless of the mode dropdown |
 | `Enter` | commit the current instance |
 | `Ctrl` `Backspace` | delete the last committed instance |
 | `Ctrl` `K` | clear the current instance's marks (keeps committed ones) |
-| `Ctrl` `Z` / `Ctrl` `Shift` `Z` | undo / redo |
+| `Ctrl` `Z` / `Ctrl` `Shift` `Z` | undo / redo, within the current mode |
+| click | *Edit Mode:* select the instance under the pointer |
+| `Delete` | *Edit Mode:* delete the selected instance |
+| `Esc` | *Edit Mode:* deselect |
 | `←` `→` | previous / next image (auto-saves) |
 | `Home` / `End` | first / last image |
 | `[` `]` | brush smaller / larger |
@@ -62,9 +74,84 @@ Committed instances are pinned as background internally, but that is not drawn
 in red — only marks you painted yourself are, or the image would disappear
 under a wash of red as you worked.
 
+Edit Mode replaces all of these with one colour per existing instance.
+
 ---
 
-## 2. Reference marks are permanent
+## 2. Edit Mode
+
+`Tab` switches between the two modes; the status bar reads `[ANNOTATE]` or
+`[EDIT]`. The modes are kept apart on purpose:
+
+* In Annotate Mode the canvas paints. Nothing can select or delete an existing
+  instance, and `Delete` does nothing at all.
+* In Edit Mode the canvas cannot start a stroke. Clicking selects; it never
+  creates an annotation, and no click reaches the segmentation engine.
+
+Switching modes does not touch the annotations, and the brush marks for an
+instance in progress survive the round trip.
+
+### Seeing the instances
+
+Every instance already on the image is drawn in its own colour from a
+twelve-colour palette, so neighbours are told apart at a glance:
+
+| state | fill | border |
+| --- | --- | --- |
+| normal | very light, the image stays readable | thin, 1.2 px |
+| hovered | stronger | 1.8 px |
+| selected | strongest | 2.6 px, over a white halo |
+
+The fill is kept deliberately low because the reason to open Edit Mode is to
+look at what is under the annotation. The border does the work of showing where
+the instance actually ends, and it is drawn with a cosmetic pen, so it stays
+one line wide at every zoom level.
+
+### Selecting
+
+Move the pointer over an instance to highlight it, click to select it. The
+status bar then shows what it is: `selected #42  class 4: electronic_board`,
+using the annotation's own id and category, not the tool's defaults.
+
+Where instances overlap, **the smallest one under the pointer wins**. A small
+instance drawn on top of a large one would otherwise be impossible to pick,
+and the large one is still reachable everywhere the small one is not. Clicking
+empty space, or pressing `Esc`, clears the selection.
+
+### Deleting
+
+`Delete` removes the selected instance and nothing else:
+
+* it is dropped from the in-memory instance list for this image,
+* the view updates immediately,
+* and `annotations.json` is rewritten straight away, through the same atomic
+  save the rest of the tool uses.
+
+Every other annotation is left exactly as it was, down to its id and any keys
+this tool does not understand (see [section 4](#4-output-format)). With nothing
+selected, or in Annotate Mode, `Delete` only prints a note in the status bar.
+The image file is never touched.
+
+### Undo and redo
+
+`Ctrl+Z` / `Ctrl+Shift+Z` undo and redo *within the current mode*. In Edit Mode
+they walk a list of the instances you deleted, putting each one back at the
+position it held, as the same object with the same annotation id. In Annotate
+Mode they keep working on the constraint marks exactly as before.
+
+The two histories are deliberately separate: one stack would mean `Ctrl+Z`
+sometimes redrawing a brush mark and sometimes resurrecting an annotation, with
+no way to tell in advance which you were about to get. The edit history holds
+64 steps and is cleared when you move to another image, because by then the
+change has already been written to disk.
+
+Deleting an instance re-seeds the remaining ones as background and therefore
+starts the in-progress instance over, exactly as `Ctrl+Backspace` always has.
+Finish and commit what you are painting before editing.
+
+---
+
+## 3. Reference marks are permanent
 
 This is the part worth understanding, because it changes how the tool behaves
 compared to most paint-select tools.
@@ -106,7 +193,7 @@ correct.
 
 ---
 
-## 3. Output format
+## 4. Output format
 
 One `annotations.json` per folder, standard COCO:
 
@@ -149,6 +236,16 @@ the previous good file intact rather than a truncated one.
 `--category-id` and `--category-name` override the defaults if you need a
 different class.
 
+### What a round trip preserves
+
+An annotation loaded from the file and not edited is written back **as it came
+in**: its id, its `category_id`, its polygons, and any extra keys the file
+carried that this tool has no opinion about. Only instances you paint yourself,
+or edit, have their `segmentation`, `area` and `bbox` regenerated from the
+mask. Deleting one instance therefore leaves the others byte-for-byte as they
+were, and a multi-class file keeps its other classes and its `categories`
+list.
+
 ### Holes
 
 Contours are extracted with `RETR_EXTERNAL` by default: outer boundaries only,
@@ -161,7 +258,7 @@ separate polygons. Only turn it on if your training code handles them.
 
 ---
 
-## 4. Speed and quality
+## 5. Speed and quality
 
 Measured on a 1920×1080 image, CPython 3.11, one core, no GPU, painting a
 30-stamp drag. `python tools/profile_segmentation.py IMAGE --compare`
@@ -221,7 +318,7 @@ the worse p95.
 
 ---
 
-## 5. Module layout
+## 6. Module layout
 
 Exactly the split you asked for:
 
@@ -233,6 +330,8 @@ Exactly the split you asked for:
 | `quickselect/annotator/polygon.py` | mask → polygons, simplification, COCO serialisation |
 | `quickselect/annotator/dataset_io.py` | COCO load/save, folder scanning |
 | `quickselect/annotator/session.py` | per-image state: constraints, mask, instances |
+| `quickselect/annotator/editing.py` | modes, instance hit-testing, selection, edit history |
+| `quickselect/annotator/instance_view.py` | the Edit Mode palette and overlay compositing |
 | `quickselect/annotator/worker.py` | the segmentation thread and its coalescing queue |
 | `quickselect/annotator/app.py` | the PySide6 window |
 | `tools/profile_segmentation.py` | the stage-timing CLI |
@@ -258,9 +357,21 @@ session.commit_instance()
 entries = session.to_annotations(image_id=1, next_id_fn=lambda: 1)
 ```
 
+Edit Mode is scriptable for the same reason -- `editing.py` has no Qt import
+either:
+
+```python
+from quickselect.annotator.editing import InstanceEditor
+
+editor = InstanceEditor(session)
+editor.select(editor.hit_test(x=820, y=430))
+editor.delete_selected()
+editor.undo()
+```
+
 ---
 
-## 6. Known limits
+## 7. Known limits
 
 * **Same colour across a weak edge still leaks.** Two touching boards of
   identical colour will select together; alt-painting one clears it, but the
@@ -274,6 +385,13 @@ entries = session.to_annotations(image_id=1, next_id_fn=lambda: 1)
 * **Undo granularity is one stroke.** Committing an instance is not undoable
   through `Ctrl+Z`; use "Delete last instance".
 * **RLE segmentations are not editable.** Loading a COCO file that uses RLE
-  masks skips those entries rather than converting them.
+  masks skips those entries rather than converting them. They are skipped on
+  load, so they are also not written back -- do not edit a folder whose file
+  mixes RLE with polygons.
+* **Edit Mode deletes, it does not reshape.** Selecting an instance and
+  changing its outline or its class is not implemented; to fix geometry,
+  delete the instance and paint it again.
+* **Editing discards the instance in progress.** Deleting an instance re-seeds
+  the constraint map, which starts the object you were painting over.
 * **Single-threaded solves.** PyMaxflow is not parallel and there is no
   CUDA/OpenCL path.

@@ -24,21 +24,81 @@ from ..constraints import NEGATIVE, POSITIVE, UNLABELED, ConstraintMap
 from ..imagedata import ROI
 from ..profile import Profiler
 from ..segmenter import SegmentParams, Segmenter, local_roi
-from .polygon import annotation_from_mask, mask_to_polygons, polygons_to_mask
+from .polygon import (
+    annotation_from_mask,
+    mask_to_polygons,
+    polygons_bbox,
+    polygons_to_mask,
+)
 
 
 @dataclass
 class Instance:
-    """One committed object: the polygons plus the pixels they came from."""
+    """One committed object: the polygons plus the pixels they came from.
+
+    Instances loaded from a COCO file keep their original entry in ``raw``.
+    As long as nobody edits their geometry they are written back verbatim, so
+    ids, unusual categories and any extra keys the file carried survive a
+    round trip through the tool.
+    """
 
     mask: np.ndarray
     polygons: List[List[float]]
     annotation_id: Optional[int] = None
+    category_id: Optional[int] = None
     source: str = "user"  # 'user' for this session, 'loaded' from the JSON
+    raw: Optional[Dict] = None
+    dirty: bool = False   # geometry changed since it was loaded
+    _bounds: Optional[Tuple[int, int, int, int]] = field(
+        default=None, repr=False, compare=False
+    )
 
     @property
     def area(self) -> int:
         return int(self.mask.sum())
+
+    def bounds(self) -> Tuple[int, int, int, int]:
+        """Pixel bounding box as ``(x0, y0, x1, y1)``, x1/y1 exclusive.
+
+        Derived from the polygons when there are any -- cheaper than scanning
+        the mask -- and cached, because hit-testing asks for it on every mouse
+        move.
+        """
+        if self._bounds is None:
+            self._bounds = self._compute_bounds()
+        return self._bounds
+
+    def _compute_bounds(self) -> Tuple[int, int, int, int]:
+        height, width = self.mask.shape[:2]
+        if self.polygons:
+            x, y, w, h = polygons_bbox(self.polygons)
+            x0, y0 = int(np.floor(x)), int(np.floor(y))
+            x1, y1 = int(np.ceil(x + w)) + 1, int(np.ceil(y + h)) + 1
+        else:
+            rows = np.any(self.mask, axis=1)
+            cols = np.any(self.mask, axis=0)
+            if not rows.any():
+                return (0, 0, 0, 0)
+            y0, y1 = int(np.argmax(rows)), height - int(np.argmax(rows[::-1]))
+            x0, x1 = int(np.argmax(cols)), width - int(np.argmax(cols[::-1]))
+        x0 = max(0, min(x0, width))
+        y0 = max(0, min(y0, height))
+        x1 = max(x0, min(x1, width))
+        y1 = max(y0, min(y1, height))
+        return (x0, y0, x1, y1)
+
+    def contains(self, x: float, y: float) -> bool:
+        """Is this image-space point inside the instance?"""
+        xi, yi = int(x), int(y)
+        x0, y0, x1, y1 = self.bounds()
+        if not (x0 <= xi < x1 and y0 <= yi < y1):
+            return False
+        return bool(self.mask[yi, xi])
+
+    def invalidate(self) -> None:
+        """Drop cached geometry after the mask or polygons changed."""
+        self._bounds = None
+        self.dirty = True
 
 
 class AnnotationSession:
@@ -71,6 +131,9 @@ class AnnotationSession:
         self.polygon_min_area = 64.0
         self.polygon_mode = "external"
         self.seed_committed_as_background = True
+        # The class new instances are committed with. ``None`` defers to the
+        # default passed to :meth:`to_annotations`.
+        self.category_id: Optional[int] = None
 
     # ------------------------------------------------------------------ #
     # Brush gestures. Coordinates are full-resolution image pixels.
@@ -178,7 +241,11 @@ class AnnotationSession:
         )
         if not polygons:
             return None
-        instance = Instance(mask=self.mask.copy(), polygons=polygons)
+        instance = Instance(
+            mask=self.mask.copy(),
+            polygons=polygons,
+            category_id=self.category_id,
+        )
         self.instances.append(instance)
 
         # Clear the marks for the next instance, then pin everything already
@@ -193,12 +260,39 @@ class AnnotationSession:
     def delete_last_instance(self) -> bool:
         if not self.instances:
             return False
-        self.instances.pop()
+        return self.remove_instance(len(self.instances) - 1) is not None
+
+    def remove_instance(self, index: int) -> Optional[Instance]:
+        """Drop one instance by position and return it.
+
+        The caller keeps the returned object, which is what makes undo a
+        matter of handing the same instance back to :meth:`insert_instance`.
+        """
+        if not 0 <= index < len(self.instances):
+            return None
+        instance = self.instances.pop(index)
+        self._reset_after_instance_change()
+        return instance
+
+    def insert_instance(self, index: int, instance: Instance) -> None:
+        """Put an instance back at a given position (the undo of removal)."""
+        index = max(0, min(int(index), len(self.instances)))
+        self.instances.insert(index, instance)
+        self._reset_after_instance_change()
+
+    def _reset_after_instance_change(self) -> None:
+        """Rebuild the derived state after the instance list changed.
+
+        The constraint matrix carries a background seed for every committed
+        instance and the colour models carry its samples, and neither records
+        which instance it came from. Removing one therefore means starting the
+        in-progress instance over, exactly as deleting the last one always
+        has.
+        """
         self.constraints.clear_all()
         self.mask = np.zeros((self.height, self.width), dtype=bool)
         self._reseed_committed()
         self._resync_models()
-        return True
 
     def _reseed_committed(self) -> None:
         """Mark committed instance pixels as background for the next instance."""
@@ -230,36 +324,56 @@ class AnnotationSession:
             if not isinstance(polygons[0], (list, tuple)):
                 continue  # RLE, which this tool does not produce or edit
             mask = polygons_to_mask(polygons, self.height, self.width)
+            annotation_id = entry.get("id")
             self.instances.append(
                 Instance(
                     mask=mask,
                     polygons=[list(map(float, p)) for p in polygons],
-                    annotation_id=entry.get("id"),
+                    annotation_id=None if annotation_id is None else int(annotation_id),
+                    category_id=(
+                        int(entry["category_id"]) if "category_id" in entry else None
+                    ),
                     source="loaded",
+                    raw=dict(entry),
                 )
             )
         self._reseed_committed()
 
     def to_annotations(self, image_id: int, next_id_fn, category_id: int = 4
                        ) -> List[Dict]:
-        """Serialise every committed instance as COCO entries."""
+        """Serialise every committed instance as COCO entries.
+
+        An instance loaded from the file and never edited is written back as
+        it came in, so its category and any keys this tool does not understand
+        survive the round trip. Only new or modified instances have their
+        geometry, area and bbox regenerated from the mask.
+        """
         out: List[Dict] = []
         for inst in self.instances:
             ann_id = inst.annotation_id
             if ann_id is None:
                 ann_id = next_id_fn()
                 inst.annotation_id = ann_id
+            if inst.raw is not None and not inst.dirty:
+                entry = dict(inst.raw)
+                entry["id"] = int(ann_id)
+                entry["image_id"] = int(image_id)
+                out.append(entry)
+                continue
             entry = annotation_from_mask(
                 inst.mask,
                 image_id=image_id,
                 annotation_id=ann_id,
-                category_id=category_id,
+                category_id=(
+                    category_id if inst.category_id is None else inst.category_id
+                ),
                 epsilon_ratio=self.polygon_epsilon,
                 min_area=self.polygon_min_area,
                 mode=self.polygon_mode,
             )
             if entry is not None:
                 out.append(entry)
+                inst.dirty = False
         return out
 
     # ------------------------------------------------------------------ #

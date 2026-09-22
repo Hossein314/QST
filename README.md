@@ -21,7 +21,10 @@ python annotate.py /path/to/images
 ```
 
 It uses a stricter selection model in which user brush marks are permanent
-constraints and the mask is a pure function of them. See **[ANNOTATOR.md](ANNOTATOR.md)** for that tool, its JSON output format, and the speed/quality
+constraints and the mask is a pure function of them. It has two modes, switched
+with `Tab`: Annotate Mode paints new instances, Edit Mode selects and deletes
+the ones already in the file. See **[ANNOTATOR.md](ANNOTATOR.md)** for that
+tool, its modes and shortcuts, its JSON output format, and the speed/quality
 parameter table.
 
 ---
@@ -383,11 +386,13 @@ quickselect/
     worker.py     engine thread and coalescing command queue
     viewer.py     side-by-side comparison window
   annotator/
-    polygon.py    mask -> COCO polygons
-    dataset_io.py COCO JSON load/save, folder scanning
-    session.py    per-image annotation state
-    worker.py     segmentation thread
-    app.py        the annotation window
+    polygon.py       mask -> COCO polygons
+    dataset_io.py    COCO JSON load/save, folder scanning
+    session.py       per-image annotation state
+    editing.py       modes, instance selection, edit undo/redo
+    instance_view.py Edit Mode colours and overlay compositing
+    worker.py        segmentation thread
+    app.py           the annotation window
 tools/
   diff_masks.py          batch diff CLI
   compare_viewer.py      comparison viewer
