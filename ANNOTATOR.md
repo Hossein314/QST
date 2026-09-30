@@ -6,7 +6,8 @@ tool writes COCO polygons.
 
 It has two modes, switched with `Tab`: **Annotate Mode** creates new instances
 with the brush, **Edit Mode** lets you point at the instances already on the
-image and delete the ones that are wrong.
+image and delete or relabel the ones that are wrong. The number keys `0`-`9`
+set the class in both modes.
 
 ```bash
 pip install -r requirements.txt
@@ -51,6 +52,7 @@ bar, in square brackets.
 | click | *Edit Mode:* select the instance under the pointer |
 | `Delete` | *Edit Mode:* delete the selected instance |
 | `Esc` | *Edit Mode:* deselect |
+| `0`-`9` | set the class: of the selected instance in Edit Mode, of the instance you commit next in Annotate Mode |
 | `←` `→` | previous / next image (auto-saves) |
 | `Home` / `End` | first / last image |
 | `[` `]` | brush smaller / larger |
@@ -93,8 +95,9 @@ instance in progress survive the round trip.
 
 ### Seeing the instances
 
-Every instance already on the image is drawn in its own colour from a
-twelve-colour palette, so neighbours are told apart at a glance:
+Every instance already on the image is drawn in the colour of its class (see
+[Telling the classes apart](#telling-the-classes-apart)), filled and outlined
+according to what the pointer is doing:
 
 | state | fill | border |
 | --- | --- | --- |
@@ -118,6 +121,41 @@ instance drawn on top of a large one would otherwise be impossible to pick,
 and the large one is still reachable everywhere the small one is not. Clicking
 empty space, or pressing `Esc`, clears the selection.
 
+### Telling the classes apart
+
+**Colour means class, not instance.** Every instance of the same
+`category_id` is drawn in the same hue, so how the image is labelled is
+readable at a glance and a mislabelled object is the one wrong colour in a
+group. Instances of the same class are still separated by their own borders
+and by hover.
+
+Each instance also carries a small chip at the centre of its bounding box with
+its class id on it, drawn at a fixed size so it stays legible at any zoom. The
+status bar spells out the selected instance in full:
+`selected #42  class 4: electronic_board`.
+
+### Setting the class
+
+The number keys `0`-`9` assign a class. What they act on depends on the mode:
+
+* **Edit Mode** — the selected instance is relabelled immediately, and the
+  file is written straight away. With nothing selected the key does nothing
+  but print a reminder. The colour and the chip change as you press it, so the
+  result is visible without looking at the status bar.
+* **Annotate Mode** — the key sets the class the *next* commit will use. Press
+  it at any time while painting, before `Enter`; the active class is shown in
+  the status bar, tinted in that class's colour.
+
+Relabelling keeps the instance's geometry exactly as it was: only
+`category_id` changes in the file, the polygons are not re-derived. A class
+the file has never seen is added to `categories` as `class_<id>` when you
+first use it, so the output stays a valid COCO file; rename it there if you
+want a meaningful name. `Ctrl+Z` undoes a relabel like any other edit, and
+pressing the same digit twice is one edit, not two.
+
+Only classes `0`-`9` are reachable from the keyboard. For a class id above 9,
+start the tool with `--category-id`.
+
 ### Deleting
 
 `Delete` removes the selected instance and nothing else:
@@ -135,9 +173,11 @@ The image file is never touched.
 ### Undo and redo
 
 `Ctrl+Z` / `Ctrl+Shift+Z` undo and redo *within the current mode*. In Edit Mode
-they walk a list of the instances you deleted, putting each one back at the
-position it held, as the same object with the same annotation id. In Annotate
-Mode they keep working on the constraint marks exactly as before.
+they walk a list of the edits you made — deletions and class changes — undoing
+each one: a deleted instance goes back to the position it held, as the same
+object with the same annotation id, and a relabelled one gets its old class
+back. In Annotate Mode they keep working on the constraint marks exactly as
+before.
 
 The two histories are deliberately separate: one stack would mean `Ctrl+Z`
 sometimes redrawing a brush mark and sometimes resurrecting an annotation, with
@@ -240,7 +280,9 @@ different class.
 
 An annotation loaded from the file and not edited is written back **as it came
 in**: its id, its `category_id`, its polygons, and any extra keys the file
-carried that this tool has no opinion about. Only instances you paint yourself,
+carried that this tool has no opinion about. Relabelling one changes its
+`category_id` and nothing else — the original polygons, area and bbox are kept
+verbatim, because only the label changed. Only instances you paint yourself,
 or edit, have their `segmentation`, `area` and `bbox` regenerated from the
 mask. Deleting one instance therefore leaves the others byte-for-byte as they
 were, and a multi-class file keeps its other classes and its `categories`
@@ -388,9 +430,11 @@ editor.undo()
   masks skips those entries rather than converting them. They are skipped on
   load, so they are also not written back -- do not edit a folder whose file
   mixes RLE with polygons.
-* **Edit Mode deletes, it does not reshape.** Selecting an instance and
-  changing its outline or its class is not implemented; to fix geometry,
-  delete the instance and paint it again.
+* **Edit Mode deletes and relabels, it does not reshape.** Changing an
+  instance's outline is not implemented; to fix geometry, delete the instance
+  and paint it again.
+* **The keyboard reaches classes 0-9 only.** Higher category ids have to come
+  from `--category-id` or from the file.
 * **Editing discards the instance in progress.** Deleting an instance re-seeds
   the constraint map, which starts the object you were painting over.
 * **Single-threaded solves.** PyMaxflow is not parallel and there is no

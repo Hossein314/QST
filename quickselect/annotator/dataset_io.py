@@ -177,6 +177,26 @@ class CocoDataset:
         cats.extend(self._extra_categories)
         return sorted(cats, key=lambda c: int(c.get("id", 0)))
 
+    def ensure_category(self, category_id: int, name: Optional[str] = None) -> None:
+        """Declare a class in ``categories`` if the file does not have it yet.
+
+        Assigning an instance a class the file has never seen would otherwise
+        produce annotations pointing at a category that does not exist, which
+        most COCO loaders treat as a hard error.
+        """
+        category_id = int(category_id)
+        if category_id == int(self.category_id):
+            return
+        for cat in self._extra_categories:
+            if int(cat.get("id", -1)) == category_id:
+                return
+        self._extra_categories.append({
+            "id": category_id,
+            "name": name or f"class_{category_id}",
+            "supercategory": "object",
+        })
+        self.dirty = True
+
     def category_name_for(self, category_id: int) -> str:
         """Human name for a class id, including classes we only pass through."""
         if int(category_id) == int(self.category_id):

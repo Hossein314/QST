@@ -358,6 +358,11 @@ class AnnotationSession:
                 entry = dict(inst.raw)
                 entry["id"] = int(ann_id)
                 entry["image_id"] = int(image_id)
+                # A reclassified instance keeps its original polygons: only
+                # the label changed, so re-deriving the geometry would be a
+                # pointless (and lossy) rewrite.
+                if inst.category_id is not None:
+                    entry["category_id"] = int(inst.category_id)
                 out.append(entry)
                 continue
             entry = annotation_from_mask(

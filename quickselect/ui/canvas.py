@@ -25,7 +25,10 @@ import cv2
 import numpy as np
 from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import (
+    QBrush,
     QColor,
+    QFont,
+    QFontMetrics,
     QImage,
     QPainter,
     QPainterPath,
@@ -83,6 +86,12 @@ def contour_path(
     return path if drawn else None
 
 
+def _readable_on(color: QColor) -> QColor:
+    """Black or white text, whichever the background can carry."""
+    luma = 0.299 * color.red() + 0.587 * color.green() + 0.114 * color.blue()
+    return QColor(20, 20, 20) if luma > 140 else QColor(255, 255, 255)
+
+
 def numpy_to_qimage(rgb: np.ndarray) -> QImage:
     """RGB/RGBA/grayscale uint8 -> QImage, copied so it owns its buffer."""
     arr = np.ascontiguousarray(rgb)
@@ -126,6 +135,8 @@ class Canvas(QWidget):
         self._order: List[str] = []
         self._paths: Dict[str, List[Tuple[QPainterPath, QColor, float]]] = {}
         self._path_order: List[str] = []
+        self._labels: Dict[str, List[Tuple[QPointF, str, QColor]]] = {}
+        self._label_order: List[str] = []
 
         self._zoom = 1.0
         self._offset = QPointF(0.0, 0.0)  # image-space point at widget origin
@@ -167,6 +178,8 @@ class Canvas(QWidget):
         self._order.clear()
         self._paths.clear()
         self._path_order.clear()
+        self._labels.clear()
+        self._label_order.clear()
         self.update()
 
     def set_overlay(
@@ -254,6 +267,32 @@ class Canvas(QWidget):
         if name in self._paths:
             del self._paths[name]
             self._path_order.remove(name)
+            self.update()
+
+    def set_labels(
+        self,
+        name: str,
+        entries: Optional[List[Tuple[QPointF, str, QColor]]],
+    ) -> None:
+        """Add or replace a named set of small text chips.
+
+        Each entry is ``(point, text, colour)`` with the point in image
+        coordinates. The chip itself is drawn in screen space at a fixed size,
+        so a label stays readable when zoomed out and does not swell into a
+        billboard when zoomed in.
+        """
+        if not entries:
+            self.remove_labels(name)
+            return
+        if name not in self._labels:
+            self._label_order.append(name)
+        self._labels[name] = list(entries)
+        self.update()
+
+    def remove_labels(self, name: str) -> None:
+        if name in self._labels:
+            del self._labels[name]
+            self._label_order.remove(name)
             self.update()
 
     def remove_overlay(self, name: str) -> None:
@@ -418,6 +457,7 @@ class Canvas(QWidget):
                 self._draw_ants(painter, transform.map(ov.path))
 
         self._draw_paths(painter, transform)
+        self._draw_labels(painter, transform)
         self._draw_brush_cursor(painter)
         painter.end()
 
@@ -429,6 +469,31 @@ class Canvas(QWidget):
                 painter.setPen(pen)
                 painter.setBrush(Qt.NoBrush)
                 painter.drawPath(transform.map(path))
+
+    def _draw_labels(self, painter: QPainter, transform: QTransform) -> None:
+        if not self._label_order:
+            return
+        font = QFont(self.font())
+        font.setPointSizeF(max(7.5, font.pointSizeF()))
+        font.setBold(True)
+        painter.setFont(font)
+        metrics = QFontMetrics(font)
+        for name in self._label_order:
+            for point, text, color in self._labels[name]:
+                at = transform.map(point)
+                if not self.rect().adjusted(-40, -20, 40, 20).contains(at.toPoint()):
+                    continue  # off screen; skip the work
+                w = metrics.horizontalAdvance(text) + 10
+                h = metrics.height() + 2
+                chip = QRectF(at.x() - w / 2.0, at.y() - h / 2.0, w, h)
+                back = QColor(color)
+                back.setAlpha(225)
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QBrush(back))
+                painter.drawRoundedRect(chip, 3.0, 3.0)
+                painter.setBrush(Qt.NoBrush)
+                painter.setPen(QPen(_readable_on(back), 1.0))
+                painter.drawText(chip, Qt.AlignCenter, text)
 
     def _draw_ants(self, painter: QPainter, path: QPainterPath) -> None:
         # A dark under-stroke keeps the ants visible on light images.

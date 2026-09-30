@@ -22,8 +22,9 @@ python annotate.py /path/to/images
 
 It uses a stricter selection model in which user brush marks are permanent
 constraints and the mask is a pure function of them. It has two modes, switched
-with `Tab`: Annotate Mode paints new instances, Edit Mode selects and deletes
-the ones already in the file. See **[ANNOTATOR.md](ANNOTATOR.md)** for that
+with `Tab`: Annotate Mode paints new instances, Edit Mode selects, relabels and
+deletes the ones already in the file, with the number keys setting the class in
+either mode. See **[ANNOTATOR.md](ANNOTATOR.md)** for that
 tool, its modes and shortcuts, its JSON output format, and the speed/quality
 parameter table.
 

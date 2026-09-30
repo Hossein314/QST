@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import List, Optional
+from typing import List, Optional, Union
 
 from .session import AnnotationSession, Instance
 
@@ -46,6 +46,20 @@ class DeleteRecord:
     instance: Instance
 
 
+@dataclass
+class ClassRecord:
+    """One reclassified instance, with the class it had before."""
+
+    instance: Instance
+    before: Optional[int]
+    after: Optional[int]
+
+
+#: The edit history holds these. Two small records beat a command framework:
+#: each one is the change itself, and undo is reading it backwards.
+EditRecord = Union[DeleteRecord, ClassRecord]
+
+
 class InstanceEditor:
     """Selection state and edit history for the instances of one image.
 
@@ -63,8 +77,8 @@ class InstanceEditor:
         self.session: Optional[AnnotationSession] = session
         self.hover: Optional[Instance] = None
         self.selected: Optional[Instance] = None
-        self._undo: List[DeleteRecord] = []
-        self._redo: List[DeleteRecord] = []
+        self._undo: List[EditRecord] = []
+        self._redo: List[EditRecord] = []
 
     def set_session(self, session: Optional[AnnotationSession]) -> None:
         """Point at a different image. History does not cross images."""
@@ -159,7 +173,25 @@ class InstanceEditor:
             self.hover = None
         return record
 
-    def _push(self, record: DeleteRecord) -> None:
+    def set_selected_class(self, category_id: int) -> Optional[ClassRecord]:
+        """Relabel the selected instance. Returns the record, or ``None``.
+
+        Setting the class an instance already has is not an edit and does not
+        land in the history -- otherwise pressing the same digit twice would
+        cost two undos to get back.
+        """
+        inst = self.selected
+        if self.session is None or inst is None:
+            return None
+        before = inst.category_id
+        if before is not None and int(before) == int(category_id):
+            return None
+        record = ClassRecord(instance=inst, before=before, after=int(category_id))
+        inst.category_id = int(category_id)
+        self._push(record)
+        return record
+
+    def _push(self, record: EditRecord) -> None:
         self._undo.append(record)
         del self._undo[: max(0, len(self._undo) - self.history_limit)]
         self._redo.clear()
@@ -172,22 +204,30 @@ class InstanceEditor:
     def can_redo(self) -> bool:
         return bool(self._redo) and self.session is not None
 
-    def undo(self) -> Optional[DeleteRecord]:
-        """Put the most recently deleted instance back where it was."""
+    def undo(self) -> Optional[EditRecord]:
+        """Reverse the most recent edit."""
         if not self.can_undo:
             return None
         record = self._undo.pop()
         assert self.session is not None
-        self.session.insert_instance(record.index, record.instance)
+        if isinstance(record, ClassRecord):
+            record.instance.category_id = record.before
+        else:
+            self.session.insert_instance(record.index, record.instance)
         self._redo.append(record)
         self.selected = record.instance
         return record
 
-    def redo(self) -> Optional[DeleteRecord]:
+    def redo(self) -> Optional[EditRecord]:
         if not self.can_redo:
             return None
         record = self._redo.pop()
         assert self.session is not None
+        if isinstance(record, ClassRecord):
+            record.instance.category_id = record.after
+            self._undo.append(record)
+            self.selected = record.instance
+            return record
         index = self.index_of(record.instance)
         if index is None:
             # The instance is no longer in the list; the redo is meaningless.

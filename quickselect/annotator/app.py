@@ -51,7 +51,7 @@ from .dataset_io import (
     scan_folder,
 )
 from .editing import AppMode, InstanceEditor
-from .instance_view import build_instance_layers
+from .instance_view import build_instance_layers, class_color
 from .session import AnnotationSession
 
 # Overlay layers, drawn in this order.
@@ -63,6 +63,7 @@ LAYER_NEG = "constraint_neg"
 # a matching path layer.
 LAYER_INSTANCES = "edit_instances"
 PATHS_INSTANCES = "edit_outlines"
+LABELS_INSTANCES = "edit_classes"
 
 #: Layers that belong to the annotation workflow and have no place in Edit Mode.
 ANNOTATE_LAYERS = (LAYER_COMMITTED, LAYER_CURRENT, LAYER_POS, LAYER_NEG)
@@ -167,6 +168,14 @@ class AnnotatorWindow(QMainWindow):
             "&Delete Selected Instance", "Delete", self.delete_selected, mode
         )
         self._act("Des&elect", "Escape", self.deselect, mode)
+        mode.addSeparator()
+        # 0-9 set the class: of the selected instance in Edit Mode, of the
+        # instance about to be committed in Annotate Mode.
+        for digit in range(10):
+            self._act(
+                f"Set Class &{digit}", str(digit),
+                lambda _=False, d=digit: self.set_class(d), mode,
+            )
 
         view = self.menuBar().addMenu("&View")
         self._act("Zoom &In", "Ctrl+=", lambda: self._zoom_by(1.25), view)
@@ -305,6 +314,7 @@ class AnnotatorWindow(QMainWindow):
             self.statusBar().addWidget(w)
         self.statusBar().addPermanentWidget(self.timing_label)
         self._update_mode_label()
+        self._show_class(self.category_id, self.category_name)
 
     def _update_mode_label(self) -> None:
         self.mode_label.setText(f"  [{self.app_mode.label}]  ")
@@ -499,6 +509,57 @@ class AnnotatorWindow(QMainWindow):
             self._refresh_overlays()
             self._update_status()
 
+    def set_class(self, category_id: int) -> None:
+        """A number key. What it labels depends on the mode.
+
+        In Edit Mode it relabels the selected instance and saves. In Annotate
+        Mode it sets the class the next commit will use, so you can press the
+        digit at any point while painting -- before `Enter`, as you would
+        expect from the label appearing in the status bar.
+        """
+        if self.editing:
+            if self.editor.selected is None:
+                self.statusBar().showMessage(
+                    "Select an instance first, then press a number", 2500
+                )
+                return
+            self._register_category(category_id)
+            self._apply_edit(
+                lambda: self.editor.set_selected_class(category_id),
+                f"Already class {category_id}",
+            )
+            return
+        self._set_active_class(category_id)
+
+    def _set_active_class(self, category_id: int) -> None:
+        """Choose the class new instances are committed with."""
+        self.category_id = int(category_id)
+        # Declare it before asking for its name, or an unknown class reads
+        # back as a bare number instead of its placeholder name.
+        self._register_category(self.category_id)
+        self.category_name = self._category_name(self.category_id)
+        if self.session is not None:
+            self.session.category_id = self.category_id
+        # Directly, because _update_status does nothing without an open folder.
+        self._show_class(self.category_id, self.category_name)
+        self._update_status()
+        self.statusBar().showMessage(
+            f"Class {self.category_id}: {self.category_name} "
+            f"-- applies to the instance you commit next",
+            2500,
+        )
+
+    def _register_category(self, category_id: int) -> None:
+        if self.dataset is not None:
+            self.dataset.ensure_category(int(category_id))
+
+    def _category_name(self, category_id: int) -> str:
+        if self.dataset is not None:
+            return self.dataset.category_name_for(int(category_id))
+        if int(category_id) == self.category_id:
+            return self.category_name
+        return f"class_{int(category_id)}"
+
     def deselect(self) -> None:
         if self.editing and self.editor.clear_selection():
             self._refresh_overlays()
@@ -647,20 +708,23 @@ class AnnotatorWindow(QMainWindow):
         assert self.session is not None
         for layer in ANNOTATE_LAYERS:
             self.canvas.remove_overlay(layer)
-        rgba, paths = build_instance_layers(
+        rgba, paths, labels = build_instance_layers(
             self.session.instances,
             self.session.height,
             self.session.width,
             hover=self.editor.hover,
             selected=self.editor.selected,
+            default_category=self.category_id,
         )
         self.canvas.set_overlay_rgba(LAYER_INSTANCES, rgba)
         self.canvas.set_paths(PATHS_INSTANCES, paths)
+        self.canvas.set_labels(LABELS_INSTANCES, labels)
 
     def _show_annotation_overlays(self) -> None:
         assert self.session is not None
         self.canvas.remove_overlay(LAYER_INSTANCES)
         self.canvas.remove_paths(PATHS_INSTANCES)
+        self.canvas.remove_labels(LABELS_INSTANCES)
         if self.show_committed_action.isChecked():
             committed = self.session.committed_mask()
             self.canvas.set_overlay(
@@ -704,12 +768,21 @@ class AnnotatorWindow(QMainWindow):
             n = len(self.session.instances)
             pending = " (+1 in progress)" if self.session.mask.any() else ""
             self.instance_label.setText(f"Instances: {n}{pending}   ")
-        self.class_label.setText(
-            f"class {self.category_id}: {self.category_name}   "
-        )
+        self._show_class(self.category_id, self.category_name)
         self.selection_label.setText(self._selection_summary())
         if self._last_timings:
             self.timing_label.setText(f"  last pass: {self._last_timings}  ")
+
+    def _show_class(self, category_id: int, name: str) -> None:
+        """Write the active class into the status bar, in its own colour.
+
+        The same colour the instances of that class are drawn in, so the
+        readout and the canvas can be matched up without counting.
+        """
+        self.class_label.setText(f"class {category_id}: {name}   ")
+        self.class_label.setStyleSheet(
+            f"color: {class_color(category_id).name()};"
+        )
 
     def _selection_summary(self) -> str:
         """What the selected instance is, for the status bar."""
