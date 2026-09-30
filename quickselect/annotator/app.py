@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSlider,
+    QSpinBox,
     QToolBar,
     QWidget,
 )
@@ -92,6 +93,7 @@ class AnnotatorWindow(QMainWindow):
         self.session: Optional[AnnotationSession] = None
         self.app_mode = AppMode.ANNOTATE
         self.editor = InstanceEditor()
+        self._syncing_class = False
         self._image: Optional[np.ndarray] = None
         self._last_timings = ""
         self._busy = False
@@ -218,6 +220,28 @@ class AnnotatorWindow(QMainWindow):
         self.mode_box.currentIndexChanged.connect(self._on_mode_changed)
         bar.addWidget(self.mode_box)
 
+        # The class readout sits first in the tool row, because "what am I
+        # labelling?" is the question you ask before every segment.
+        bar.addSeparator()
+        bar.addWidget(QLabel("  Class "))
+        self.class_swatch = QLabel()
+        self.class_swatch.setFixedSize(14, 14)
+        bar.addWidget(self.class_swatch)
+        self.class_spin = QSpinBox()
+        self.class_spin.setRange(0, 9999)
+        self.class_spin.setValue(self.category_id)
+        self.class_spin.setFixedWidth(64)
+        self.class_spin.setToolTip(
+            "The class the next committed instance gets. 0-9 are also on "
+            "the number keys; in Edit Mode this relabels the selected "
+            "instance instead."
+        )
+        self.class_spin.valueChanged.connect(self._on_class_spin)
+        bar.addWidget(self.class_spin)
+        self.class_name_box = QLabel()
+        self.class_name_box.setMinimumWidth(130)
+        bar.addWidget(self.class_name_box)
+
         bar.addSeparator()
         bar.addWidget(QLabel("  Brush "))
         self.size_slider = QSlider(Qt.Horizontal)
@@ -296,6 +320,8 @@ class AnnotatorWindow(QMainWindow):
         button("Redo", self.redo, "Ctrl+Shift+Z")
         flow.addSeparator()
         button("Save all", self.save_all, "Ctrl+S")
+
+        self._sync_class_widgets()
 
     def _build_status(self) -> None:
         # The mode indicator lives in the status bar rather than in a banner of
@@ -402,9 +428,18 @@ class AnnotatorWindow(QMainWindow):
         if existing:
             session.load_instances(existing)
 
-        session.category_id = self.category_id
         self.session = session
         self.editor.set_session(session)
+        # Pick up where this image left off: the class of the last instance
+        # on it is almost always the class of the next one you draw.
+        last = next(
+            (i.category_id for i in reversed(session.instances)
+             if i.category_id is not None),
+            None,
+        )
+        if last is not None and int(last) != self.category_id:
+            self._set_active_class(int(last), announce=False)
+        session.category_id = self.category_id
         self.worker.set_session(session)
         self.canvas.set_image(image)
         self._refresh_overlays()
@@ -480,6 +515,7 @@ class AnnotatorWindow(QMainWindow):
         self._update_mode_label()
         self._refresh_overlays()
         self._update_status()
+        self._sync_class_widgets()
         self.statusBar().showMessage(
             "Edit Mode -- click an instance to select, Delete removes it"
             if mode is AppMode.EDIT
@@ -508,6 +544,7 @@ class AnnotatorWindow(QMainWindow):
         if self.editor.select_at(x, y):
             self._refresh_overlays()
             self._update_status()
+            self._sync_class_widgets()
 
     def set_class(self, category_id: int) -> None:
         """A number key. What it labels depends on the mode.
@@ -528,11 +565,19 @@ class AnnotatorWindow(QMainWindow):
                 lambda: self.editor.set_selected_class(category_id),
                 f"Already class {category_id}",
             )
+            # Relabelling is also a statement of what you are working on, so
+            # the next new segment inherits it.
+            self._set_active_class(category_id, announce=False)
             return
         self._set_active_class(category_id)
 
-    def _set_active_class(self, category_id: int) -> None:
-        """Choose the class new instances are committed with."""
+    def _set_active_class(self, category_id: int, announce: bool = True) -> None:
+        """Choose the class new instances are committed with.
+
+        This is sticky: it survives commits, image changes and mode switches,
+        because annotation runs in streaks of the same class and retyping the
+        digit for every object would be the most-pressed key in the tool.
+        """
         self.category_id = int(category_id)
         # Declare it before asking for its name, or an unknown class reads
         # back as a bare number instead of its placeholder name.
@@ -542,11 +587,50 @@ class AnnotatorWindow(QMainWindow):
             self.session.category_id = self.category_id
         # Directly, because _update_status does nothing without an open folder.
         self._show_class(self.category_id, self.category_name)
+        self._sync_class_widgets()
         self._update_status()
-        self.statusBar().showMessage(
-            f"Class {self.category_id}: {self.category_name} "
-            f"-- applies to the instance you commit next",
-            2500,
+        if announce:
+            self.statusBar().showMessage(
+                f"Class {self.category_id}: {self.category_name} "
+                f"-- applies to the instance you commit next",
+                2500,
+            )
+
+    @Slot(int)
+    def _on_class_spin(self, value: int) -> None:
+        """The toolbar spin box. Same meaning as the number keys."""
+        if self._syncing_class:
+            return
+        self.set_class(int(value))
+
+    def _displayed_class(self) -> int:
+        """Which class the toolbar should be showing right now."""
+        if self.editing and self.editor.selected is not None:
+            selected = self.editor.selected.category_id
+            if selected is not None:
+                return int(selected)
+        return self.category_id
+
+    def _sync_class_widgets(self) -> None:
+        """Push the current class into the toolbar without re-triggering it."""
+        category = self._displayed_class()
+        colour = class_color(category)
+        self._syncing_class = True
+        try:
+            self.class_spin.setValue(int(category))
+        finally:
+            self._syncing_class = False
+        self.class_swatch.setStyleSheet(
+            f"background: {colour.name()}; border: 1px solid #202020;"
+        )
+        name = self._category_name(category)
+        selected = self.editing and self.editor.selected is not None
+        self.class_name_box.setText(
+            f" {name}  (selected)" if selected else f" {name}"
+        )
+        self.class_name_box.setToolTip(
+            "Class of the selected instance" if selected
+            else "Class the next committed instance gets"
         )
 
     def _register_category(self, category_id: int) -> None:
@@ -564,6 +648,7 @@ class AnnotatorWindow(QMainWindow):
         if self.editing and self.editor.clear_selection():
             self._refresh_overlays()
             self._update_status()
+            self._sync_class_widgets()
 
     def delete_selected(self) -> None:
         """Delete key. Deliberately inert outside Edit Mode."""
@@ -595,6 +680,7 @@ class AnnotatorWindow(QMainWindow):
             return
         self._refresh_overlays()
         self._update_status()
+        self._sync_class_widgets()
         self._flush_current()   # persists to annotations.json, atomically
 
     # ------------------------------------------------------------------ #

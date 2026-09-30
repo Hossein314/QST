@@ -52,7 +52,7 @@ bar, in square brackets.
 | click | *Edit Mode:* select the instance under the pointer |
 | `Delete` | *Edit Mode:* delete the selected instance |
 | `Esc` | *Edit Mode:* deselect |
-| `0`-`9` | set the class: of the selected instance in Edit Mode, of the instance you commit next in Annotate Mode |
+| `0`-`9` | set the class: of the selected instance in Edit Mode, of the instance you commit next in Annotate Mode. The choice sticks until you change it |
 | `←` `→` | previous / next image (auto-saves) |
 | `Home` / `End` | first / last image |
 | `[` `]` | brush smaller / larger |
@@ -153,8 +153,36 @@ first use it, so the output stays a valid COCO file; rename it there if you
 want a meaningful name. `Ctrl+Z` undoes a relabel like any other edit, and
 pressing the same digit twice is one edit, not two.
 
-Only classes `0`-`9` are reachable from the keyboard. For a class id above 9,
-start the tool with `--category-id`.
+### The class is sticky
+
+You set a class once and it stays set. Annotation runs in streaks of the same
+class, so the alternative — retyping the digit before every object — would
+make it the most-pressed key in the tool. Concretely, the class for the next
+instance you commit is:
+
+* the last class you chose, whether you chose it with a number key, with the
+  toolbar spin box, or by relabelling an instance in Edit Mode; it survives
+  commits, mode switches and moving between images;
+* or, when you open an image that already has annotations, **the class of the
+  last instance on it** — you are usually continuing what you were doing on
+  that image rather than starting a different class.
+
+### The class indicator
+
+The **Class** group at the left of the tool row always answers "what am I
+labelling?": a colour swatch in that class's own colour — the same colour its
+instances are drawn in on the canvas — the class id in a spin box, and the
+class name.
+
+The spin box is an input as well as a readout, and it is how you reach a class
+above `9`, which the number keys cannot express. It follows the same rule as
+the digits: in Annotate Mode it sets the class for the next commit, in Edit
+Mode it relabels the selected instance.
+
+When an instance is selected in Edit Mode the group shows **that instance's**
+class and appends `(selected)`, so there is never a question of whether you
+are looking at the selection or at what you are about to draw. The status bar
+repeats it in full, tinted in the same colour.
 
 ### Deleting
 
@@ -433,8 +461,11 @@ editor.undo()
 * **Edit Mode deletes and relabels, it does not reshape.** Changing an
   instance's outline is not implemented; to fix geometry, delete the instance
   and paint it again.
-* **The keyboard reaches classes 0-9 only.** Higher category ids have to come
-  from `--category-id` or from the file.
+* **The keyboard reaches classes 0-9 only.** There are ten digit keys. For a
+  higher category id use the **Class** spin box in the tool row, or start the
+  tool with `--category-id`.
+* **New classes are named `class_<id>`.** The tool has nowhere to ask for a
+  real name; edit `categories` in the JSON if you want one.
 * **Editing discards the instance in progress.** Deleting an instance re-seeds
   the constraint map, which starts the object you were painting over.
 * **Single-threaded solves.** PyMaxflow is not parallel and there is no
